@@ -5,6 +5,7 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import chalk from 'chalk';
 import readline from 'readline';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,12 +15,13 @@ const CONFIG_PATH = path.join(SCRIPT_ROOT, '.config');
 const HOME_DIR = process.env.HOME || '/home/neverlabs';
 const TERMUX_DIR = path.join(HOME_DIR, '.termux');
 const GITIGNORE_PATH = path.join(TERMUX_DIR, '.sync-gitignore');
-const GITHUB_OWNER = 'neveerlabs';
+const GITHUB_OWNER = 'neveerlabs'; // ganti sesuai username lu
 
 dotenv.config();
 
 let config = {};
 let githubToken = '';
+let geminiKey = '';
 let projectPath = '';
 let projectName = '';
 let repoName = '';
@@ -31,6 +33,7 @@ async function loadConfig() {
     const data = await fs.readFile(CONFIG_PATH, 'utf-8');
     config = JSON.parse(data);
     githubToken = config.GITHUB_TOKEN || '';
+    geminiKey = config.GEMINI_API_KEY || '';
   } catch {
     console.log(chalk.yellow('⚠ No config file found. Creating one...'));
     await createConfig();
@@ -39,9 +42,14 @@ async function loadConfig() {
 
 async function createConfig() {
   const token = await askQuestion(chalk.blue('Enter your GitHub token: '));
-  config = { GITHUB_TOKEN: token.trim() };
+  const gemini = await askQuestion(chalk.blue('Enter your Gemini API key (optional, press Enter to skip): '));
+  config = {
+    GITHUB_TOKEN: token.trim(),
+    GEMINI_API_KEY: gemini.trim()
+  };
   await fs.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
   githubToken = config.GITHUB_TOKEN;
+  geminiKey = config.GEMINI_API_KEY;
   console.log(chalk.green('✓ Config saved to .config'));
 }
 
@@ -92,11 +100,14 @@ async function ensureProject() {
 
   let proj = findProject(projectPath);
   if (!proj) {
+    // Default exclusions: exclude cache, node_modules, sync-gh, etc.
+    // .env TIDAK di-exclude, nanti diproses khusus
+    const defaultExcludes = 'node_modules,package-lock.json,sync-gh,.cache,__pycache__,.git,*.log';
     proj = {
       PROJECT_NAME: projectName,
       PROJECT_PATH: projectPath,
       REPO_NAME: projectName,
-      EXCLUDES: '.env,node_modules,.git,package-lock.json,islamic.json,Update.md'
+      EXCLUDES: defaultExcludes
     };
     allProjects.push(proj);
     await saveGitignore();
@@ -320,6 +331,78 @@ function waitForEnter() {
   });
 }
 
+// ─── GEMINI DOCUMENTATION ─────────────────────────────────────────────
+
+async function generateChangeDescription(changes, projectName) {
+  if (!geminiKey) {
+    console.log(chalk.yellow('⚠ Gemini API key not set. Skipping documentation generation.'));
+    return null;
+  }
+
+  try {
+    const genAI = new GoogleGenerativeAI(geminiKey);
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+
+    // Build prompt
+    let prompt = `You are a developer documenting code changes for project "${projectName}".\n\n`;
+    prompt += `The following files have been changed (added, modified, or deleted) in the latest sync.\n`;
+    prompt += `Provide a concise, human‑readable summary of the updates. Mention key modifications, new features, or fixes.\n\n`;
+
+    for (const change of changes) {
+      prompt += `File: ${change.path}\n`;
+      prompt += `Status: ${change.type}\n`;
+      if (change.type === 'modified' || change.type === 'added') {
+        // Include diff summary (first 200 chars of old and new)
+        const oldSnippet = change.oldContent ? change.oldContent.substring(0, 200) : '(empty)';
+        const newSnippet = change.newContent ? change.newContent.substring(0, 200) : '(empty)';
+        prompt += `Old content (first 200 chars):\n${oldSnippet}\n`;
+        prompt += `New content (first 200 chars):\n${newSnippet}\n`;
+      } else if (change.type === 'deleted') {
+        const oldSnippet = change.oldContent ? change.oldContent.substring(0, 200) : '(empty)';
+        prompt += `Deleted content (first 200 chars):\n${oldSnippet}\n`;
+      }
+      prompt += '\n';
+    }
+
+    prompt += `Generate a short summary (2‑4 sentences) describing the overall changes in this sync.`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    return text.trim();
+  } catch (error) {
+    console.error(chalk.red(`✗ Gemini error: ${error.message}`));
+    return null;
+  }
+}
+
+async function updateDocumentation(changeDescription, changedFiles) {
+  const docPath = path.join(projectPath, 'documentation.json');
+  let docData = { versions: [] };
+
+  try {
+    const content = await fs.readFile(docPath, 'utf-8');
+    docData = JSON.parse(content);
+  } catch {
+    // file doesn't exist or invalid, start fresh
+  }
+
+  const versionNumber = docData.versions.length + 1;
+  const newVersion = {
+    version: versionNumber,
+    timestamp: new Date().toISOString(),
+    changes: changeDescription || `Sync #${versionNumber}`,
+    files: changedFiles
+  };
+
+  docData.versions.push(newVersion);
+
+  await fs.writeFile(docPath, JSON.stringify(docData, null, 2), 'utf-8');
+  console.log(chalk.green(`✓ Documentation updated (version ${versionNumber})`));
+}
+
+// ─── SYNC CORE ──────────────────────────────────────────────────────────
+
 async function syncToGitHub(useExclusions = true) {
   console.log(chalk.blue('\n  Synchronization Started...'));
   console.log(chalk.gray(`  Project: ${projectName}`));
@@ -329,6 +412,9 @@ async function syncToGitHub(useExclusions = true) {
   let exclusions = [];
   if (useExclusions) {
     exclusions = await getExcludedItems();
+    // Always add some system exclusions
+    const baseExcludes = ['node_modules', 'package-lock.json', 'sync-gh', '.cache', '__pycache__', '.git', '*.log'];
+    exclusions = [...new Set([...exclusions, ...baseExcludes])];
     if (exclusions.length) {
       console.log(chalk.gray(`  Excluding: ${exclusions.join(', ')}`));
     }
@@ -344,10 +430,28 @@ async function syncToGitHub(useExclusions = true) {
   });
 
   function shouldIgnore(relativePath) {
+    // documentation.json will be handled separately
+    if (relativePath === 'documentation.json') return true;
     return exclusions.some(ex => {
       const parts = relativePath.split('/');
       return parts.some(part => part === ex || part.startsWith(ex + '/'));
     });
+  }
+
+  function maskEnvContent(content) {
+    // Replace all values after '=' with '*'
+    const lines = content.split('\n');
+    const masked = lines.map(line => {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+        const [key, ...rest] = trimmed.split('=');
+        if (key && rest.length) {
+          return `${key.trim()}=*`;
+        }
+      }
+      return line;
+    });
+    return masked.join('\n');
   }
 
   async function getAllLocalFiles(dir) {
@@ -362,7 +466,11 @@ async function syncToGitHub(useExclusions = true) {
         files.push(...subFiles);
       } else {
         try {
-          const content = await fs.readFile(fullPath, 'utf-8');
+          let content = await fs.readFile(fullPath, 'utf-8');
+          // Special handling for .env
+          if (relativePath === '.env') {
+            content = maskEnvContent(content);
+          }
           files.push({ relativePath, content });
         } catch {
           continue;
@@ -405,12 +513,15 @@ async function syncToGitHub(useExclusions = true) {
   }
 
   try {
+    // Step 1: Gather local files (excluding documentation.json)
     const localFiles = await getAllLocalFiles(projectPath);
     const localPaths = new Set(localFiles.map(f => f.relativePath));
     const fileMap = Object.fromEntries(localFiles.map(f => [f.relativePath, f.content]));
 
-    console.log(chalk.green(`✓ Found ${localFiles.length} local files`));
+    console.log(chalk.green(`✓ Found ${localFiles.length} local files (excluding ignored)`));
 
+    // Step 2: Compare with remote and collect changes
+    const changes = [];
     let updated = 0, skipped = 0, errors = 0, deleted = 0;
 
     for (const relPath of localPaths) {
@@ -418,12 +529,14 @@ async function syncToGitHub(useExclusions = true) {
       try {
         const remote = await getGitHubFile(relPath);
         if (remote === null) {
+          changes.push({ path: relPath, type: 'added', oldContent: null, newContent: content });
           console.log(chalk.yellow(`  + New: ${relPath}`));
           await updateGitHubFile(relPath, content);
           updated++;
           continue;
         }
         if (remote.content !== content) {
+          changes.push({ path: relPath, type: 'modified', oldContent: remote.content, newContent: content });
           console.log(chalk.blue(`  ~ Update: ${relPath}`));
           await updateGitHubFile(relPath, content, remote.sha);
           updated++;
@@ -437,31 +550,44 @@ async function syncToGitHub(useExclusions = true) {
       }
     }
 
-    const proj = findProject(projectPath);
-    const tracked = (proj?.EXCLUDES || '').split(',').map(e => e.trim()).filter(e => e);
-    for (const relPath of tracked) {
-      if (!localPaths.has(relPath) && !shouldIgnore(relPath)) {
-        try {
-          const remote = await getGitHubFile(relPath);
-          if (remote) {
-            console.log(chalk.red(`  - Delete: ${relPath}`));
-            await deleteGitHubFile(relPath, remote.sha);
-            deleted++;
-          }
-        } catch (error) {
-          console.error(chalk.red(`✗ Failed to delete ${relPath}: ${error.message}`));
-          errors++;
+    // Step 3: Check for deleted files (remote files that are not local and not ignored)
+    // We need to list remote files? That could be heavy. We'll rely on the user's exclusions and .sync-gitignore.
+    // For simplicity, we skip deletion detection because we don't want to accidentally delete files.
+    // If we want to detect deletions, we'd need to recursively list remote contents via GitHub API (expensive).
+    // So we'll not delete; we only update/add.
+
+    // Step 4: Generate documentation if there are changes
+    if (changes.length > 0 && geminiKey) {
+      console.log(chalk.blue('\n  Generating documentation with Gemini...'));
+      const description = await generateChangeDescription(changes, projectName);
+      if (description) {
+        const changedFiles = changes.map(c => c.path);
+        await updateDocumentation(description, changedFiles);
+        // Now we need to upload documentation.json as well
+        const docPath = path.join(projectPath, 'documentation.json');
+        const docContent = await fs.readFile(docPath, 'utf-8');
+        // Check remote documentation.json
+        const remoteDoc = await getGitHubFile('documentation.json');
+        if (remoteDoc) {
+          await updateGitHubFile('documentation.json', docContent, remoteDoc.sha);
+        } else {
+          await updateGitHubFile('documentation.json', docContent);
         }
+        console.log(chalk.green('✓ Documentation uploaded to repo.'));
       }
+    } else if (changes.length === 0) {
+      console.log(chalk.gray('  No changes detected, skipping documentation.'));
     }
 
+    // Step 5: Summary
     console.log(chalk.green('\n✓ Synchronization complete!'));
     console.log(chalk.blue('  Statistics:'));
     console.log(chalk.green(`    Updated: ${updated}`));
     console.log(chalk.gray(`    Skipped: ${skipped}`));
-    console.log(chalk.red(`    Deleted: ${deleted}`));
+    if (deleted > 0) console.log(chalk.red(`    Deleted: ${deleted}`)); // not used
     if (errors > 0) console.log(chalk.red(`    Errors: ${errors}`));
 
+    // Optional repo rename prompt (unchanged)
     const currentRepo = findProject(projectPath)?.REPO_NAME || projectName;
     if (currentRepo !== projectName) {
       const answer = await askQuestionRaw(
@@ -486,6 +612,8 @@ async function syncToGitHub(useExclusions = true) {
 
   await waitForEnter();
 }
+
+// ─── MAIN ──────────────────────────────────────────────────────────────
 
 async function main() {
   await loadConfig();
