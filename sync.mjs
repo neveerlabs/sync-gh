@@ -11,7 +11,7 @@ import { spawn } from 'child_process';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const VERSION = '1.0.2';
+const VERSION = '1.0.3';
 
 const SCRIPT_ROOT = __dirname;
 const CONFIG_PATH = path.join(SCRIPT_ROOT, '.config');
@@ -350,7 +350,21 @@ function isSensitiveFile(relativePath) {
   return false;
 }
 
-function maskSensitiveContent(content) {
+function maskSensitiveContent(content, filePath) {
+  const basename = path.basename(filePath).toLowerCase();
+  if (basename === '.config' || basename === 'config.json' || basename === 'secrets.json' || basename === 'credentials.json') {
+    try {
+      const json = JSON.parse(content);
+      const masked = {};
+      for (const key in json) {
+        if (json.hasOwnProperty(key)) {
+          masked[key] = '*';
+        }
+      }
+      return JSON.stringify(masked, null, 2);
+    } catch {
+    }
+  }
   const lines = content.split('\n');
   const masked = lines.map(line => {
     const trimmed = line.trim();
@@ -484,7 +498,7 @@ async function syncToGitHub(useExclusions = true) {
         try {
           let content = await fs.readFile(fullPath, 'utf-8');
           if (isSensitiveFile(relativePath)) {
-            content = maskSensitiveContent(content);
+            content = maskSensitiveContent(content, relativePath);
           }
           files.push({ relativePath, content });
         } catch {
@@ -507,14 +521,25 @@ async function syncToGitHub(useExclusions = true) {
     }
   }
 
-  async function updateGitHubFile(relativePath, content, sha = null) {
+  async function updateGitHubFile(relativePath, content, sha = null, retries = 1) {
     const payload = {
       message: `Sync: Update ${relativePath}`,
       content: Buffer.from(content, 'utf-8').toString('base64'),
       branch: 'main',
     };
     if (sha) payload.sha = sha;
-    await githubAPI.put(relativePath.replace(/\\/g, '/'), payload);
+    try {
+      await githubAPI.put(relativePath.replace(/\\/g, '/'), payload);
+    } catch (error) {
+      if (error.response?.status === 409 && retries > 0) {
+        console.log(chalk.yellow(`  Conflict on ${relativePath}, retrying...`));
+        const remote = await getGitHubFile(relativePath);
+        if (remote) {
+          return updateGitHubFile(relativePath, content, remote.sha, retries - 1);
+        }
+      }
+      throw error;
+    }
   }
 
   async function deleteGitHubFile(relativePath, sha) {
