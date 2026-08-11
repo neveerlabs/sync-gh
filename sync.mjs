@@ -11,7 +11,7 @@ import { spawn } from 'child_process';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 
 const SCRIPT_ROOT = __dirname;
 const CONFIG_PATH = path.join(SCRIPT_ROOT, '.config');
@@ -336,6 +336,35 @@ function waitForEnter() {
   });
 }
 
+function isSensitiveFile(relativePath) {
+  const basename = path.basename(relativePath).toLowerCase();
+  const ext = path.extname(relativePath).toLowerCase();
+  const sensitiveNames = [
+    '.env', '.env.local', '.env.production', '.env.development',
+    '.config', 'config.json', 'secrets.json', 'credentials.json',
+    '.secret', '.key', '.pem', '.token', 'secret', 'key'
+  ];
+  for (const name of sensitiveNames) {
+    if (basename.includes(name)) return true;
+  }
+  return false;
+}
+
+function maskSensitiveContent(content) {
+  const lines = content.split('\n');
+  const masked = lines.map(line => {
+    const trimmed = line.trim();
+    if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+      const [key, ...rest] = trimmed.split('=');
+      if (key && rest.length) {
+        return `${key.trim()}=*`;
+      }
+    }
+    return line;
+  });
+  return masked.join('\n');
+}
+
 async function generateChangeDescription(changes, projectName) {
   if (!geminiKey) {
     console.log(chalk.yellow('⚠ Gemini API key not set. Skipping documentation generation.'));
@@ -441,21 +470,6 @@ async function syncToGitHub(useExclusions = true) {
     });
   }
 
-  function maskEnvContent(content) {
-    const lines = content.split('\n');
-    const masked = lines.map(line => {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
-        const [key, ...rest] = trimmed.split('=');
-        if (key && rest.length) {
-          return `${key.trim()}=*`;
-        }
-      }
-      return line;
-    });
-    return masked.join('\n');
-  }
-
   async function getAllLocalFiles(dir) {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     const files = [];
@@ -469,8 +483,8 @@ async function syncToGitHub(useExclusions = true) {
       } else {
         try {
           let content = await fs.readFile(fullPath, 'utf-8');
-          if (relativePath === '.env') {
-            content = maskEnvContent(content);
+          if (isSensitiveFile(relativePath)) {
+            content = maskSensitiveContent(content);
           }
           files.push({ relativePath, content });
         } catch {
