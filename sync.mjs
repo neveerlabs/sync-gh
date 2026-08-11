@@ -6,16 +6,19 @@ import dotenv from 'dotenv';
 import chalk from 'chalk';
 import readline from 'readline';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { spawn } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const VERSION = '1.0.1';
 
 const SCRIPT_ROOT = __dirname;
 const CONFIG_PATH = path.join(SCRIPT_ROOT, '.config');
 const HOME_DIR = process.env.HOME || '/home/neverlabs';
 const TERMUX_DIR = path.join(HOME_DIR, '.termux');
 const GITIGNORE_PATH = path.join(TERMUX_DIR, '.sync-gitignore');
-const GITHUB_OWNER = 'neveerlabs'; // ganti sesuai username lu
+const GITHUB_OWNER = 'neveerlabs';
 
 dotenv.config();
 
@@ -35,22 +38,26 @@ async function loadConfig() {
     githubToken = config.GITHUB_TOKEN || '';
     geminiKey = config.GEMINI_API_KEY || '';
   } catch {
-    console.log(chalk.yellow('⚠ No config file found. Creating one...'));
-    await createConfig();
+    config = {};
+    githubToken = '';
+    geminiKey = '';
   }
-}
-
-async function createConfig() {
-  const token = await askQuestion(chalk.blue('Enter your GitHub token: '));
-  const gemini = await askQuestion(chalk.blue('Enter your Gemini API key (optional, press Enter to skip): '));
-  config = {
-    GITHUB_TOKEN: token.trim(),
-    GEMINI_API_KEY: gemini.trim()
-  };
-  await fs.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
-  githubToken = config.GITHUB_TOKEN;
-  geminiKey = config.GEMINI_API_KEY;
-  console.log(chalk.green('✓ Config saved to .config'));
+  if (!githubToken) {
+    console.log(chalk.yellow('GitHub token missing.'));
+    githubToken = await askQuestion(chalk.blue('Enter your GitHub token: '));
+    config.GITHUB_TOKEN = githubToken;
+  }
+  if (!geminiKey) {
+    const answer = await askQuestion(chalk.blue('Enter your Gemini API key (optional, press Enter to skip): '));
+    if (answer) {
+      geminiKey = answer.trim();
+      config.GEMINI_API_KEY = geminiKey;
+    }
+  }
+  if (config.GITHUB_TOKEN || config.GEMINI_API_KEY) {
+    await fs.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
+    console.log(chalk.green('✓ Config saved to .config'));
+  }
 }
 
 async function loadGitignore() {
@@ -100,8 +107,6 @@ async function ensureProject() {
 
   let proj = findProject(projectPath);
   if (!proj) {
-    // Default exclusions: exclude cache, node_modules, sync-gh, etc.
-    // .env TIDAK di-exclude, nanti diproses khusus
     const defaultExcludes = 'node_modules,package-lock.json,sync-gh,.cache,__pycache__,.git,*.log';
     proj = {
       PROJECT_NAME: projectName,
@@ -331,8 +336,6 @@ function waitForEnter() {
   });
 }
 
-// ─── GEMINI DOCUMENTATION ─────────────────────────────────────────────
-
 async function generateChangeDescription(changes, projectName) {
   if (!geminiKey) {
     console.log(chalk.yellow('⚠ Gemini API key not set. Skipping documentation generation.'));
@@ -343,7 +346,6 @@ async function generateChangeDescription(changes, projectName) {
     const genAI = new GoogleGenerativeAI(geminiKey);
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-    // Build prompt
     let prompt = `You are a developer documenting code changes for project "${projectName}".\n\n`;
     prompt += `The following files have been changed (added, modified, or deleted) in the latest sync.\n`;
     prompt += `Provide a concise, human‑readable summary of the updates. Mention key modifications, new features, or fixes.\n\n`;
@@ -352,7 +354,6 @@ async function generateChangeDescription(changes, projectName) {
       prompt += `File: ${change.path}\n`;
       prompt += `Status: ${change.type}\n`;
       if (change.type === 'modified' || change.type === 'added') {
-        // Include diff summary (first 200 chars of old and new)
         const oldSnippet = change.oldContent ? change.oldContent.substring(0, 200) : '(empty)';
         const newSnippet = change.newContent ? change.newContent.substring(0, 200) : '(empty)';
         prompt += `Old content (first 200 chars):\n${oldSnippet}\n`;
@@ -372,6 +373,13 @@ async function generateChangeDescription(changes, projectName) {
     return text.trim();
   } catch (error) {
     console.error(chalk.red(`✗ Gemini error: ${error.message}`));
+    if (error.response && error.response.status === 429) {
+      console.log(chalk.yellow('  Rate limit exceeded. Please wait and try again later.'));
+    } else if (error.response && error.response.status === 403) {
+      console.log(chalk.yellow('  Access forbidden. Check your API key and permissions.'));
+    } else {
+      console.log(chalk.yellow('  Check your API key and network connection.'));
+    }
     return null;
   }
 }
@@ -384,7 +392,6 @@ async function updateDocumentation(changeDescription, changedFiles) {
     const content = await fs.readFile(docPath, 'utf-8');
     docData = JSON.parse(content);
   } catch {
-    // file doesn't exist or invalid, start fresh
   }
 
   const versionNumber = docData.versions.length + 1;
@@ -401,8 +408,6 @@ async function updateDocumentation(changeDescription, changedFiles) {
   console.log(chalk.green(`✓ Documentation updated (version ${versionNumber})`));
 }
 
-// ─── SYNC CORE ──────────────────────────────────────────────────────────
-
 async function syncToGitHub(useExclusions = true) {
   console.log(chalk.blue('\n  Synchronization Started...'));
   console.log(chalk.gray(`  Project: ${projectName}`));
@@ -412,7 +417,6 @@ async function syncToGitHub(useExclusions = true) {
   let exclusions = [];
   if (useExclusions) {
     exclusions = await getExcludedItems();
-    // Always add some system exclusions
     const baseExcludes = ['node_modules', 'package-lock.json', 'sync-gh', '.cache', '__pycache__', '.git', '*.log'];
     exclusions = [...new Set([...exclusions, ...baseExcludes])];
     if (exclusions.length) {
@@ -430,7 +434,6 @@ async function syncToGitHub(useExclusions = true) {
   });
 
   function shouldIgnore(relativePath) {
-    // documentation.json will be handled separately
     if (relativePath === 'documentation.json') return true;
     return exclusions.some(ex => {
       const parts = relativePath.split('/');
@@ -439,7 +442,6 @@ async function syncToGitHub(useExclusions = true) {
   }
 
   function maskEnvContent(content) {
-    // Replace all values after '=' with '*'
     const lines = content.split('\n');
     const masked = lines.map(line => {
       const trimmed = line.trim();
@@ -467,7 +469,6 @@ async function syncToGitHub(useExclusions = true) {
       } else {
         try {
           let content = await fs.readFile(fullPath, 'utf-8');
-          // Special handling for .env
           if (relativePath === '.env') {
             content = maskEnvContent(content);
           }
@@ -513,14 +514,12 @@ async function syncToGitHub(useExclusions = true) {
   }
 
   try {
-    // Step 1: Gather local files (excluding documentation.json)
     const localFiles = await getAllLocalFiles(projectPath);
     const localPaths = new Set(localFiles.map(f => f.relativePath));
     const fileMap = Object.fromEntries(localFiles.map(f => [f.relativePath, f.content]));
 
     console.log(chalk.green(`✓ Found ${localFiles.length} local files (excluding ignored)`));
 
-    // Step 2: Compare with remote and collect changes
     const changes = [];
     let updated = 0, skipped = 0, errors = 0, deleted = 0;
 
@@ -550,23 +549,14 @@ async function syncToGitHub(useExclusions = true) {
       }
     }
 
-    // Step 3: Check for deleted files (remote files that are not local and not ignored)
-    // We need to list remote files? That could be heavy. We'll rely on the user's exclusions and .sync-gitignore.
-    // For simplicity, we skip deletion detection because we don't want to accidentally delete files.
-    // If we want to detect deletions, we'd need to recursively list remote contents via GitHub API (expensive).
-    // So we'll not delete; we only update/add.
-
-    // Step 4: Generate documentation if there are changes
     if (changes.length > 0 && geminiKey) {
       console.log(chalk.blue('\n  Generating documentation with Gemini...'));
       const description = await generateChangeDescription(changes, projectName);
       if (description) {
         const changedFiles = changes.map(c => c.path);
         await updateDocumentation(description, changedFiles);
-        // Now we need to upload documentation.json as well
         const docPath = path.join(projectPath, 'documentation.json');
         const docContent = await fs.readFile(docPath, 'utf-8');
-        // Check remote documentation.json
         const remoteDoc = await getGitHubFile('documentation.json');
         if (remoteDoc) {
           await updateGitHubFile('documentation.json', docContent, remoteDoc.sha);
@@ -579,15 +569,13 @@ async function syncToGitHub(useExclusions = true) {
       console.log(chalk.gray('  No changes detected, skipping documentation.'));
     }
 
-    // Step 5: Summary
     console.log(chalk.green('\n✓ Synchronization complete!'));
     console.log(chalk.blue('  Statistics:'));
     console.log(chalk.green(`    Updated: ${updated}`));
     console.log(chalk.gray(`    Skipped: ${skipped}`));
-    if (deleted > 0) console.log(chalk.red(`    Deleted: ${deleted}`)); // not used
+    if (deleted > 0) console.log(chalk.red(`    Deleted: ${deleted}`));
     if (errors > 0) console.log(chalk.red(`    Errors: ${errors}`));
 
-    // Optional repo rename prompt (unchanged)
     const currentRepo = findProject(projectPath)?.REPO_NAME || projectName;
     if (currentRepo !== projectName) {
       const answer = await askQuestionRaw(
@@ -613,52 +601,101 @@ async function syncToGitHub(useExclusions = true) {
   await waitForEnter();
 }
 
-// ─── MAIN ──────────────────────────────────────────────────────────────
-
-async function main() {
-  await loadConfig();
-  if (!githubToken) {
-    console.log(chalk.red('✗ No GitHub token found. Please set it in .config'));
-    await createConfig();
+function compareVersions(v1, v2) {
+  const parts1 = v1.split('.').map(Number);
+  const parts2 = v2.split('.').map(Number);
+  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+    const n1 = parts1[i] || 0;
+    const n2 = parts2[i] || 0;
+    if (n1 !== n2) return n1 - n2;
   }
+  return 0;
+}
 
-  await loadGitignore();
-  await ensureProject();
-
-  while (true) {
-    const choice = await showMenu();
-    switch (choice) {
-      case 'sync':
-        await syncToGitHub(true);
-        break;
-      case 'sync_exclude':
-        await syncToGitHub(true);
-        break;
-      case 'view_excludes':
-        await viewExcludes();
-        break;
-      case 'add_exclude':
-        await addExclusion();
-        break;
-      case 'remove_exclude':
-        await removeExclusion();
-        break;
-      case 'set_repo':
-        await setRepoName();
-        break;
-      case 'view_settings':
-        await viewSettings();
-        break;
-      case 'exit':
-        console.log(chalk.green('\nGoodbye!'));
-        process.exit(0);
-      default:
-        break;
+async function checkScriptUpdate() {
+  try {
+    const scriptRepo = 'neveerlabs/sync-gh';
+    const url = `https://raw.githubusercontent.com/${scriptRepo}/main/sync.mjs`;
+    const response = await axios.get(url, { timeout: 10000 });
+    const remoteContent = response.data;
+    const versionMatch = remoteContent.match(/const VERSION\s*=\s*['"]([^'"]+)['"]/);
+    if (!versionMatch) {
+      console.log(chalk.yellow('Could not determine remote version. Skipping update check.'));
+      return false;
     }
+    const remoteVersion = versionMatch[1];
+    if (compareVersions(remoteVersion, VERSION) > 0) {
+      console.log(chalk.yellow(`\nNew version ${remoteVersion} available (current ${VERSION}).`));
+      const answer = await askQuestionRaw(chalk.blue('Download and update sync.mjs? (y/n): '));
+      if (answer === 'y' || answer === 'yes') {
+        console.log(chalk.blue('Downloading new version...'));
+        const localPath = path.join(SCRIPT_ROOT, 'sync.mjs');
+        await fs.writeFile(localPath, remoteContent, 'utf-8');
+        console.log(chalk.green('✓ sync.mjs updated. Restarting...'));
+        const child = spawn('node', [localPath], {
+          stdio: 'inherit',
+          detached: false,
+        });
+        child.on('error', (err) => {
+          console.error(chalk.red(`Failed to start new version: ${err.message}`));
+        });
+        process.exit(0);
+      } else {
+        console.log(chalk.gray('Skipping update.'));
+      }
+    } else {
+      console.log(chalk.gray(`Script is up to date (${VERSION}).`));
+    }
+    return true;
+  } catch (error) {
+    console.log(chalk.yellow(`Script update check failed: ${error.message}`));
+    return false;
   }
 }
 
-main().catch(error => {
-  console.error(chalk.red(`✗ Fatal: ${error.message}`));
-  process.exit(1);
-});
+async function main() {
+  try {
+    await loadConfig();
+    await checkScriptUpdate();
+    await loadGitignore();
+    await ensureProject();
+
+    while (true) {
+      const choice = await showMenu();
+      switch (choice) {
+        case 'sync':
+          await syncToGitHub(true);
+          break;
+        case 'sync_exclude':
+          await syncToGitHub(true);
+          break;
+        case 'view_excludes':
+          await viewExcludes();
+          break;
+        case 'add_exclude':
+          await addExclusion();
+          break;
+        case 'remove_exclude':
+          await removeExclusion();
+          break;
+        case 'set_repo':
+          await setRepoName();
+          break;
+        case 'view_settings':
+          await viewSettings();
+          break;
+        case 'exit':
+          console.log(chalk.green('\nGoodbye!'));
+          process.exit(0);
+        default:
+          break;
+      }
+    }
+  } catch (error) {
+    console.error(chalk.red(`✗ Fatal error: ${error.message}`));
+    console.error(error.stack);
+    process.exit(1);
+  }
+}
+
+main();
