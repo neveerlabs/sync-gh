@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/generative-ai": "^0.21.0",
     "axios": "^1.19.0",
     "chalk": "^6.0.0",
     "dotenv": "^17.4.2"
